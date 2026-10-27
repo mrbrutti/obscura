@@ -58,6 +58,14 @@ struct Args {
     #[arg(long, global = true)]
     allow_private_network: bool,
 
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Trust the certificate(s) in PATH as additional root CAs, added to the built-in roots. Repeatable. PEM bundle or DER."
+    )]
+    ca_cert: Vec<std::path::PathBuf>,
+
     /// Pass raw flags to V8, in the same form V8/Chromium/Node accept
     /// (e.g. `"--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc"`).
     /// Applied once at startup before any isolate is created.
@@ -376,6 +384,19 @@ fn effective_v8_flags(user: Option<&str>) -> String {
 
 const CLI_STACK_BYTES: usize = 512 * 1024 * 1024;
 
+/// The `--ca-cert` paths, then those in `OBSCURA_CA_CERT` (a PATH-style list).
+/// A set-but-empty variable adds nothing.
+fn ca_cert_paths(
+    flags: &[std::path::PathBuf],
+    env: Option<&std::ffi::OsStr>,
+) -> Vec<std::path::PathBuf> {
+    let mut paths = flags.to_vec();
+    if let Some(value) = env.filter(|value| !value.is_empty()) {
+        paths.extend(std::env::split_paths(value));
+    }
+    paths
+}
+
 fn main() -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("obscura-main".to_string())
@@ -446,6 +467,29 @@ async fn run_cli() -> anyhow::Result<()> {
         // threaded at this point.
         unsafe {
             std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        }
+    }
+
+    // --ca-cert / OBSCURA_CA_CERT: load the extra roots before any HTTP client
+    // exists and refuse to start on a bad file, naming it. The merged list is
+    // mirrored into the env so `serve --workers` children, which run this same
+    // startup, load the same roots.
+    let ca_cert_paths = ca_cert_paths(
+        &args.ca_cert,
+        std::env::var_os("OBSCURA_CA_CERT").as_deref(),
+    );
+    if !ca_cert_paths.is_empty() {
+        if let Err(error) = obscura_net::set_extra_root_certificates(&ca_cert_paths) {
+            eprintln!("error: --ca-cert: {error}");
+            std::process::exit(2);
+        }
+        match std::env::join_paths(&ca_cert_paths) {
+            // SAFETY: as above, before any thread reads the environment.
+            Ok(joined) => unsafe { std::env::set_var("OBSCURA_CA_CERT", joined) },
+            Err(error) => {
+                eprintln!("error: --ca-cert: {error}");
+                std::process::exit(2);
+            }
         }
     }
 
@@ -906,6 +950,10 @@ async fn run_multi_worker_serve(
         // while it continues to reject foreign hosts and browser origins.
         cmd.env("OBSCURA_CDP_FORWARDED_HOST", &host_for_workers);
         cmd.env("OBSCURA_CDP_FORWARDED_PORT", port.to_string());
+        // Inherited anyway; explicit so a future env_clear cannot drop it.
+        if let Some(ca_cert) = std::env::var_os("OBSCURA_CA_CERT") {
+            cmd.env("OBSCURA_CA_CERT", ca_cert);
+        }
         if let Some(ref p) = proxy {
             // Pass the proxy (which may embed credentials) via the environment,
             // not argv. A --proxy flag is visible in `ps`/`/proc/<pid>/cmdline`
@@ -2096,6 +2144,7 @@ async fn run_parallel_scrape(
                 .env("OBSCURA_STEALTH", if stealth { "1" } else { "" })
                 .env("OBSCURA_OBEY_ROBOTS", if obey_robots { "1" } else { "" })
                 .env("OBSCURA_USER_AGENT", user_agent.as_deref().unwrap_or(""))
+                .envs(std::env::var_os("OBSCURA_CA_CERT").map(|value| ("OBSCURA_CA_CERT", value)))
                 .spawn()
             {
                 Ok(c) => c,
@@ -2433,7 +2482,7 @@ fn dump_assets(page: &Page) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
+        ca_cert_paths, configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
         extract_readable_text, fetch_original_bytes, is_quiet_command, link_kind_from_rel,
         merge_proxy, merge_user_agent, normalize_v8_flags, read_urls_from_file, resolve_asset_url,
         select_log_filter, write_or_print, write_or_print_bytes, Args, Command, DumpFormat,
@@ -2441,6 +2490,57 @@ mod tests {
     };
     use clap::Parser;
     use obscura_dom::parse_html;
+    use std::path::PathBuf;
+
+    // --ca-cert (M2-AC5): repeatable, global, merged with OBSCURA_CA_CERT.
+    #[test]
+    fn ca_cert_is_repeatable_and_global() {
+        let args = Args::try_parse_from(["obscura", "--ca-cert", "a", "--ca-cert", "b", "serve"])
+            .expect("--ca-cert must be repeatable before the subcommand");
+        assert_eq!(args.ca_cert, vec![PathBuf::from("a"), PathBuf::from("b")]);
+
+        let args = Args::try_parse_from(["obscura", "serve", "--ca-cert", "b"])
+            .expect("--ca-cert must parse after the subcommand");
+        assert_eq!(args.ca_cert, vec![PathBuf::from("b")]);
+
+        // clap keeps only the innermost occurrence of a global argument, so a
+        // flag split across the subcommand boundary loses the outer values.
+        // Pinned so the documented "same side" rule stays true to the parser.
+        let args =
+            Args::try_parse_from(["obscura", "--ca-cert", "a", "serve", "--ca-cert", "b"])
+                .unwrap();
+        assert_eq!(args.ca_cert, vec![PathBuf::from("b")]);
+    }
+
+    #[test]
+    fn ca_cert_help_text() {
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        // Help may be wrapped to the terminal width; compare on one line.
+        let one_line = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            one_line.contains(
+                "Trust the certificate(s) in PATH as additional root CAs, added to the \
+                 built-in roots. Repeatable. PEM bundle or DER."
+            ),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn env_merges_after_flags() {
+        let env = std::env::join_paths(["b", "c"]).unwrap();
+        assert_eq!(
+            ca_cert_paths(&[PathBuf::from("a")], Some(env.as_os_str())),
+            vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]
+        );
+        assert_eq!(ca_cert_paths(&[], None), Vec::<PathBuf>::new());
+        // A set-but-empty variable (a common shell accident) adds nothing.
+        assert_eq!(
+            ca_cert_paths(&[PathBuf::from("a")], Some(std::ffi::OsStr::new(""))),
+            vec![PathBuf::from("a")]
+        );
+    }
 
     // Issue #117 — `--dump original` short-circuits the browser stack and
     // streams the raw response body verbatim, including for binary payloads.
