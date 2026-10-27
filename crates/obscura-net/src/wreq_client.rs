@@ -237,36 +237,51 @@ impl StealthHttpClient {
             .dns_resolver(Arc::new(SsrfGuardResolver::new(allow_private_network)))
             .redirect(wreq::redirect::Policy::none());
 
-        // Honor SSL_CERT_FILE / SSL_CERT_DIR in the stealth client too.
+        // Honor SSL_CERT_FILE / SSL_CERT_DIR and --ca-cert in the stealth client too.
         //
-        // `client.rs` (the reqwest path) already reads these via `configured_root_paths()` and
-        // feeds `add_root_certificate`, so a private CA works there. This client did not, which
-        // made the *better-fingerprinted* transport the only one unable to reach hosts behind a
-        // private/national CA (measured against a Brazilian government portal whose leaf is
-        // issued by an ICP-Brasil intermediate: `--stealth` failed with CERTIFICATE_VERIFY_FAILED
-        // while the reqwest path, with SSL_CERT_FILE set, completed the handshake).
+        // `client.rs` (the reqwest path) already reads these via `configured_root_certificates()`
+        // and feeds `add_root_certificate`, so a private CA works there. This client did not,
+        // which made the *better-fingerprinted* transport the only one unable to reach hosts
+        // behind a private/national CA (measured against a Brazilian government portal whose
+        // leaf is issued by an ICP-Brasil intermediate: `--stealth` failed with
+        // CERTIFICATE_VERIFY_FAILED while the reqwest path, with SSL_CERT_FILE set, completed
+        // the handshake).
         //
-        // Two deliberate constraints:
+        // Three deliberate constraints:
         //
         // 1. `tls_cert_store` is used, NOT `tls_options`. `emulation()` overwrites `tls_options`
         //    wholesale ("This will overwrite the existing configuration"), so setting TLS options
         //    here would silently discard the Chrome fingerprint — the whole point of this client.
         //    `tls_cert_store` is a separate field on the config and composes with emulation.
         //
-        // 2. Opt-in only. Supplying a store REPLACES the webpki roots (see `set_cert_store` in
-        //    `tls/conn/ext.rs`), it does not add to them. Applying it unconditionally would break
-        //    every ordinary site whenever the bundle is incomplete. With neither variable set,
-        //    behaviour is byte-for-byte what it was before.
-        if crate::client::custom_cert_store_requested(
+        // 2. Add, never replace. Supplying a store REPLACES the webpki roots (see
+        //    `set_cert_store` in `tls/conn/ext.rs`), it does not add to them, so the built-in
+        //    roots go into the store first (`webpki-root-certs`, the crate wreq bundles). The
+        //    env roots used to be the whole store, which broke every ordinary site whenever the
+        //    bundle was incomplete.
+        //
+        // 3. Opt-in only. With neither the variables nor --ca-cert set, behaviour is
+        //    byte-for-byte what it was before.
+        let env_roots_requested = crate::client::custom_cert_store_requested(
             std::env::var_os("SSL_CERT_FILE").as_deref(),
             std::env::var_os("SSL_CERT_DIR").as_deref(),
-        ) {
-            match wreq::tls::trust::CertStore::builder().set_default_paths().build() {
+        );
+        let extra_root_pem = crate::client::extra_root_pem();
+        if env_roots_requested || !extra_root_pem.is_empty() {
+            let mut store = wreq::tls::trust::CertStore::builder()
+                .add_der_certs(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter());
+            if env_roots_requested {
+                store = store.set_default_paths();
+            }
+            if !extra_root_pem.is_empty() {
+                store = store.add_stack_pem_certs(extra_root_pem);
+            }
+            match store.build() {
                 Ok(store) => builder = builder.tls_cert_store(store),
-                Err(error) => tracing::warn!(
+                Err(error) => tracing::error!(
                     %error,
-                    "SSL_CERT_FILE/SSL_CERT_DIR set but the certificate store failed to build; \
-                     continuing with the default roots"
+                    "SSL_CERT_FILE/SSL_CERT_DIR or --ca-cert set but the certificate store \
+                     failed to build; continuing with the default roots only"
                 ),
             }
         }
@@ -956,5 +971,150 @@ mod tests {
             .await
             .expect("loopback hostname must be reachable with the opt-in");
         assert_eq!(resp.status, 200);
+    }
+
+    // --ca-cert over the stealth transport. Mirrors client::ssrf_tests: a
+    // throwaway CA signs a 127.0.0.1 leaf that serves one canned response.
+    // The roots are process-wide (OnceLock, SSL_CERT_FILE), so these are only
+    // correct under `cargo nextest`.
+    async fn https_fixture_with_private_ca() -> (u16, String) {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        // BoringSSL treats a leaf whose issuer name equals its own subject as
+        // self-signed and refuses it at depth 0, and it picks the issuer from
+        // the store by name alone, so every fixture CA needs a distinct name
+        // (rustls, which the reqwest fixture runs against, does not care).
+        static NEXT_CA: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+        let ca_number = NEXT_CA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ca_params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            format!("obscura test CA {ca_number}"),
+        );
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf_params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+        let certs = vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
+            leaf_cert.der().to_vec(),
+        )];
+        let key = tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+            tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(
+                leaf_key.serialize_der(),
+            ),
+        );
+        let config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut buf = [0u8; 2048];
+                    let _ = tls.read(&mut buf).await;
+                    let body = "private ca ok";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+
+        (port, ca_cert.pem())
+    }
+
+    fn write_ca_file(pem: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), pem).unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn stealth_ca_cert_trusts_private_ca() {
+        let (port, ca_pem) = https_fixture_with_private_ca().await;
+        let ca_file = write_ca_file(&ca_pem);
+        crate::client::set_extra_root_certificates(&[ca_file.path().to_path_buf()]).unwrap();
+
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
+        let resp = client
+            .fetch(&url)
+            .await
+            .expect("--ca-cert root must be trusted by the stealth client");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.text(), "private ca ok");
+    }
+
+    #[tokio::test]
+    async fn stealth_private_ca_rejected_without_extra_roots() {
+        let (port, _ca_pem) = https_fixture_with_private_ca().await;
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
+        client
+            .fetch(&url)
+            .await
+            .expect_err("an unknown CA must be rejected by the stealth client");
+    }
+
+    // The store handed to `tls_cert_store` REPLACES wreq's defaults, so the
+    // webpki roots have to be put back explicitly. With --ca-cert set, a public
+    // site whose chain ends in a webpki root must still verify. Offline runs
+    // may fail to connect; a certificate failure is never acceptable.
+    #[tokio::test]
+    async fn stealth_store_keeps_webpki_roots() {
+        let (_port, ca_pem) = https_fixture_with_private_ca().await;
+        let ca_file = write_ca_file(&ca_pem);
+        crate::client::set_extra_root_certificates(&[ca_file.path().to_path_buf()]).unwrap();
+
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, false);
+        let url = Url::parse("https://example.com/").unwrap();
+        match client.fetch(&url).await {
+            Ok(resp) => assert!(resp.status < 500, "status {}", resp.status),
+            Err(error) => {
+                let message = error.to_string().to_lowercase();
+                assert!(
+                    !message.contains("certificate") && !message.contains("verify"),
+                    "webpki roots must survive --ca-cert: {message}"
+                );
+                eprintln!("example.com unreachable, webpki check skipped: {message}");
+            }
+        }
+    }
+
+    // SSL_CERT_FILE and --ca-cert add to each other: a leaf under either CA
+    // verifies in one client. Before, the env store replaced every other root.
+    #[tokio::test]
+    async fn stealth_env_and_flag_roots_are_both_trusted() {
+        let (flag_port, flag_ca) = https_fixture_with_private_ca().await;
+        let (env_port, env_ca) = https_fixture_with_private_ca().await;
+        let flag_file = write_ca_file(&flag_ca);
+        let env_file = write_ca_file(&env_ca);
+        std::env::set_var("SSL_CERT_FILE", env_file.path());
+        crate::client::set_extra_root_certificates(&[flag_file.path().to_path_buf()]).unwrap();
+
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        for port in [flag_port, env_port] {
+            let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
+            let resp = client
+                .fetch(&url)
+                .await
+                .unwrap_or_else(|error| panic!("port {port}: {error}"));
+            assert_eq!(resp.status, 200);
+        }
     }
 }
