@@ -14,10 +14,20 @@ subcommand to use it with `serve` or `fetch`.
     --user-agent <UA>        Override the User-Agent
     --storage-dir <DIR>      Persistent cookies and localStorage
     --allow-private-network  Permit loopback / RFC1918 / link-local
+    --ca-cert <PATH>         Trust PATH as an additional root CA (repeatable; PEM bundle or DER)
     --v8-flags <FLAGS>       Raw V8 flags, applied at startup
 -h, --help                   Help
 -V, --version                Version
 ```
+
+`--ca-cert` adds the certificate(s) in `PATH` to the built-in roots (it never
+replaces them, and hostname and chain checks stay strict), so a site re-signed
+by an intercepting proxy or a corporate TLS gateway verifies. Pass it once per
+file, with every `--ca-cert` on the same side of the subcommand (clap keeps only
+the innermost group when a global flag appears both before and after it). A path
+that is missing, unreadable, or does not hold a certificate ends
+the process with exit code 2 before anything binds. `OBSCURA_CA_CERT` is the
+environment equivalent; see [Environment variables](Environment-variables.md).
 
 ## `obscura fetch <URL>`
 
@@ -81,11 +91,13 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
     --allow-file-access      Permit CDP clients to navigate to file:// URLs
     --storage-dir <DIR>      Persistent cookies and localStorage
     --allow-private-network  Permit loopback / RFC1918 / link-local
+    --ca-cert <PATH>         Trust PATH as an additional root CA (global; repeatable)
 -q, --quiet                  Suppress info logging
 -v, --verbose                Enable info logging
 ```
 
-Default endpoint is `ws://127.0.0.1:9222`.
+Default endpoint is `ws://127.0.0.1:9222`. With `--workers N`, each worker
+process receives `--ca-cert` through `OBSCURA_CA_CERT`.
 
 ## `obscura scrape [URLS]...`
 
@@ -126,6 +138,7 @@ Run obscura as an MCP server.
     --user-agent <UA>        Override the User-Agent
     --stealth                Consistent browser fingerprint + tracker blocking (global)
     --allow-private-network  Permit loopback / RFC1918 / link-local
+    --ca-cert <PATH>         Trust PATH as an additional root CA (global; repeatable)
 -v, --verbose                Enable info logging
 ```
 

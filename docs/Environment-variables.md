@@ -86,6 +86,20 @@ Default proxy URL used by `obscura-worker` for the parallel `scrape` command whe
 OBSCURA_PROXY=http://proxy.example.com:8080 obscura scrape - < urls.txt
 ```
 
+### `OBSCURA_CA_CERT`
+
+Extra root CAs, as a `PATH`-style list of files (`:`-separated on Unix). Each file is a PEM bundle or one DER certificate. The certificates are added to the built-in roots (and to any `SSL_CERT_FILE` / `SSL_CERT_DIR` roots), never used in their place, and hostname and chain checks stay strict. A file that is missing, unreadable, or holds no certificate (a private key, for instance) ends the process with exit code 2, naming the file, before anything binds. Paths given with `--ca-cert` come first, then this list. `serve --workers N` sets it for each worker.
+
+```bash
+OBSCURA_CA_CERT=/etc/aitmproxy/ca.crt obscura serve --proxy http://127.0.0.1:8080
+```
+
+Per-process equivalent: `--ca-cert <PATH>` on any subcommand, repeatable.
+
+### `SSL_CERT_FILE` / `SSL_CERT_DIR`
+
+The OpenSSL-style variables are honored as well: the PEM bundle in `SSL_CERT_FILE` and every file in `SSL_CERT_DIR` are added to the built-in roots, in the stealth client too (where they used to replace them). Unlike `--ca-cert`, these are not validated at startup: an unreadable or unparsable file is skipped with a warning, with one caveat. A file that is not a certificate at all (a private key kept in `SSL_CERT_DIR`, for instance) is taken as DER and makes the reqwest-based clients panic when the first HTTPS request builds them. Keep only certificates there, or use `--ca-cert`, which checks each file before starting.
+
 ## Stealth and identity
 
 These tune the browser identity the engine presents so it stays internally consistent. See [Configure stealth and proxies](Configure-stealth-and-proxies.md) for the full picture.

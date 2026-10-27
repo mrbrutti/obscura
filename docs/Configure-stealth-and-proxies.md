@@ -68,6 +68,30 @@ SOCKS5:
 obscura fetch https://example.com --proxy socks5://proxy.example.com:1080
 ```
 
+## Private CAs and intercepting proxies
+
+An intercepting proxy (mitmproxy, aitmproxy, a corporate TLS gateway) re-signs
+every site with its own CA, which no browser trusts out of the box. Obscura
+verifies against a built-in root set and ignores the OS trust store, so hand it
+the CA directly:
+
+```bash
+obscura --ca-cert ~/.mitmproxy/mitmproxy-ca-cert.pem --proxy http://127.0.0.1:8080 fetch https://example.com
+obscura --ca-cert /path/to/ca.crt --proxy http://127.0.0.1:8080 serve
+```
+
+`--ca-cert` is global and repeatable; each file is a PEM bundle or one DER
+certificate. The roots are added to the built-in ones, never substituted for
+them, and validation stays as strict as before: a leaf from some other unknown
+CA, or one whose name does not match the host, is still rejected. A path that
+is missing, unreadable, or does not hold a certificate stops the process with
+exit code 2 before anything binds. `OBSCURA_CA_CERT=/a.pem:/b.pem` does the same
+from the environment, and `serve --workers N` passes it to each worker.
+
+With `--stealth` the same roots go into the wreq (BoringSSL) store on top of the
+bundled webpki roots. `SSL_CERT_FILE` / `SSL_CERT_DIR` are honored as well; see
+[Environment variables](Environment-variables.md) for their caveats.
+
 ## Custom User-Agent
 
 ```bash
