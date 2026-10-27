@@ -379,3 +379,34 @@ impl ModuleLoader for ObscuraModuleLoader {
         })))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ObscuraModuleLoader;
+
+    // --ca-cert (M2-AC4): the loader's standalone client (used without a page
+    // network context) must trust the configured roots. Roots and env are
+    // process-wide, so this is only correct under `cargo nextest`.
+    #[tokio::test]
+    async fn module_loader_standalone_client_trusts_extra_roots() {
+        let (port, ca_pem) = crate::test_support::https_fixture_with_private_ca().await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), ca_pem).unwrap();
+        obscura_net::set_extra_root_certificates(&[ca_file.path().to_path_buf()]).unwrap();
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+
+        let base = format!("https://127.0.0.1:{port}/");
+        let loader = ObscuraModuleLoader::with_proxy(&base, None);
+        let client = loader
+            .standalone_client
+            .clone()
+            .expect("a loader without page state owns a standalone client");
+        let url = url::Url::parse(&base).unwrap();
+        let resp = client
+            .fetch(&url)
+            .await
+            .expect("the module loader's client must trust the --ca-cert root");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.text(), crate::test_support::FIXTURE_BODY);
+    }
+}

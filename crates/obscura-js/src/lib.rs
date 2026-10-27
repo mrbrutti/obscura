@@ -12,6 +12,8 @@ mod write_stream;
 #[cfg(test)]
 mod indexed_db_tests;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod webcrypto_tests;
 
 pub use markdown::HTML_TO_MARKDOWN_JS;

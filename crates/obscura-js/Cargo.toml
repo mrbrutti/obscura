@@ -53,3 +53,11 @@ hkdf = "0.12"
 # CSPRNG for getRandomValues / randomUUID (replaces Math.random).
 getrandom = "0.2"
 obscura-render = { workspace = true, optional = true }
+
+[dev-dependencies]
+# TLS fixture for the --ca-cert client tests, same pins as obscura-net: rcgen
+# mints a throwaway CA + leaf, tokio-rustls (ring provider, like reqwest's
+# rustls) serves one HTTPS response with them.
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tempfile = "3"

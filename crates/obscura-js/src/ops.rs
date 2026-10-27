@@ -3452,6 +3452,12 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
             .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
         builder = builder.proxy(p);
     }
+    // Same roots as the page's shared client (SSL_CERT_FILE/DIR, --ca-cert), so
+    // a scripted fetch()/XHR that lands on this fallback trusts what navigation
+    // trusts.
+    for certificate in obscura_net::configured_root_certificates() {
+        builder = builder.add_root_certificate(certificate.clone());
+    }
     builder
         .build()
         .map_err(|e| format!("failed to build reqwest::Client: {}", e))
@@ -5574,6 +5580,27 @@ mod tests {
             let _ = sock.shutdown().await;
         });
         addr
+    }
+
+    // --ca-cert (M2-AC4): the fallback fetch()/XHR client must trust the
+    // configured roots like the page's shared client does. Roots and env are
+    // process-wide, so this is only correct under `cargo nextest`.
+    #[tokio::test]
+    async fn fallback_fetch_client_trusts_extra_roots() {
+        let (port, ca_pem) = crate::test_support::https_fixture_with_private_ca().await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), ca_pem).unwrap();
+        obscura_net::set_extra_root_certificates(&[ca_file.path().to_path_buf()]).unwrap();
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+
+        let client = super::build_request_client(None).expect("client must build");
+        let resp = client
+            .get(format!("https://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect("the fallback fetch client must trust the --ca-cert root");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), crate::test_support::FIXTURE_BODY);
     }
 
     #[tokio::test]
