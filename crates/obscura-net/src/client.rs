@@ -34,31 +34,169 @@ fn configured_root_paths() -> Vec<std::path::PathBuf> {
     paths
 }
 
-fn configured_root_certificates() -> &'static [reqwest::Certificate] {
-    static ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
-
-    ROOTS.get_or_init(|| {
-        let mut certificates = Vec::new();
-        for path in configured_root_paths() {
-            let bytes = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "failed to read CA certificate file");
-                    continue;
-                }
-            };
-            match reqwest::Certificate::from_pem_bundle(&bytes) {
-                Ok(mut bundle) if !bundle.is_empty() => certificates.append(&mut bundle),
-                _ => match reqwest::Certificate::from_der(&bytes) {
-                    Ok(certificate) => certificates.push(certificate),
-                    Err(error) => {
-                        tracing::warn!(%error, path = %path.display(), "failed to parse CA certificate file");
-                    }
-                },
+/// Roots named by SSL_CERT_FILE / SSL_CERT_DIR. Unreadable or unparsable
+/// files are skipped with a warning, as before.
+fn env_root_certificates() -> Vec<reqwest::Certificate> {
+    let mut certificates = Vec::new();
+    for path in configured_root_paths() {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "failed to read CA certificate file");
+                continue;
             }
+        };
+        match reqwest::Certificate::from_pem_bundle(&bytes) {
+            Ok(mut bundle) if !bundle.is_empty() => certificates.append(&mut bundle),
+            _ => match reqwest::Certificate::from_der(&bytes) {
+                Ok(certificate) => certificates.push(certificate),
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "failed to parse CA certificate file");
+                }
+            },
+        }
+    }
+    certificates
+}
+
+/// Roots configured once at startup through `--ca-cert` / `OBSCURA_CA_CERT`.
+/// They are added to the built-in and env roots, never used in their place.
+struct ExtraRoots {
+    certificates: Vec<reqwest::Certificate>,
+    /// The same roots as one PEM stack, for trust stores that take PEM (the
+    /// stealth client's BoringSSL store).
+    pem: Vec<u8>,
+}
+
+static EXTRA_ROOTS: OnceLock<ExtraRoots> = OnceLock::new();
+static ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
+
+/// Trust the certificates in `paths` as additional root CAs. Each file is a
+/// PEM bundle or one DER certificate. Returns how many certificates were
+/// loaded. Fails, naming the path, on the first file that is unreadable,
+/// holds no certificate, or holds something a root store rejects. Call once,
+/// before the first request; a second call is an error.
+pub fn set_extra_root_certificates(
+    paths: &[std::path::PathBuf],
+) -> Result<usize, ObscuraNetError> {
+    if EXTRA_ROOTS.get().is_some() {
+        return Err(ObscuraNetError::CaCertificate(
+            "extra root certificates are already configured".into(),
+        ));
+    }
+    if ROOTS.get().is_some() {
+        return Err(ObscuraNetError::CaCertificate(
+            "root certificates are already in use; configure --ca-cert before the first request"
+                .into(),
+        ));
+    }
+    let roots = load_extra_root_certificates(paths)?;
+    let count = roots.certificates.len();
+    EXTRA_ROOTS.set(roots).map_err(|_| {
+        ObscuraNetError::CaCertificate("extra root certificates are already configured".into())
+    })?;
+    Ok(count)
+}
+
+fn load_extra_root_certificates(
+    paths: &[std::path::PathBuf],
+) -> Result<ExtraRoots, ObscuraNetError> {
+    let mut roots = ExtraRoots {
+        certificates: Vec::new(),
+        pem: Vec::new(),
+    };
+    for path in paths {
+        let fail =
+            |reason: String| ObscuraNetError::CaCertificate(format!("{}: {reason}", path.display()));
+        let bytes = std::fs::read(path).map_err(|error| fail(error.to_string()))?;
+        let (certificates, pem) = match reqwest::Certificate::from_pem_bundle(&bytes) {
+            Ok(bundle) if !bundle.is_empty() => (bundle, pem_certificate_blocks(&bytes)),
+            _ => match reqwest::Certificate::from_der(&bytes) {
+                Ok(certificate) => (vec![certificate], der_to_pem(&bytes)),
+                Err(error) => return Err(fail(error.to_string())),
+            },
+        };
+        // `Certificate` does not parse its bytes; the root store does, when a
+        // client is built. Build one here so a bad file is reported now, with
+        // its path, instead of panicking in `get_client` on the first request.
+        let mut probe = Client::builder();
+        for certificate in &certificates {
+            probe = probe.add_root_certificate(certificate.clone());
+        }
+        probe
+            .build()
+            .map_err(|error| fail(format!("not a CA certificate ({})", error_chain(&error))))?;
+        roots.certificates.extend(certificates);
+        roots.pem.extend_from_slice(&pem);
+    }
+    Ok(roots)
+}
+
+/// The `CERTIFICATE` blocks of a PEM file, verbatim, each newline-terminated.
+/// Other blocks (a key kept next to its certificate) do not reach a trust store.
+fn pem_certificate_blocks(bytes: &[u8]) -> Vec<u8> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let text = String::from_utf8_lossy(bytes);
+    let mut rest: &str = &text;
+    let mut out = Vec::new();
+    while let Some(start) = rest.find(BEGIN) {
+        let Some(end) = rest[start..].find(END) else {
+            break;
+        };
+        let stop = start + end + END.len();
+        out.extend_from_slice(&rest.as_bytes()[start..stop]);
+        out.push(b'\n');
+        rest = &rest[stop..];
+    }
+    out
+}
+
+fn der_to_pem(der: &[u8]) -> Vec<u8> {
+    let mut out = b"-----BEGIN CERTIFICATE-----\n".to_vec();
+    for line in base64_standard(der).as_bytes().chunks(64) {
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+    out.extend_from_slice(b"-----END CERTIFICATE-----\n");
+    out
+}
+
+fn base64_standard(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// Every configured root: SSL_CERT_FILE / SSL_CERT_DIR roots first, then the
+/// `--ca-cert` roots. Built once, at the first client; `--ca-cert` roots set
+/// after that are refused by `set_extra_root_certificates`.
+pub fn configured_root_certificates() -> &'static [reqwest::Certificate] {
+    ROOTS.get_or_init(|| {
+        let mut certificates = env_root_certificates();
+        if let Some(extra) = EXTRA_ROOTS.get() {
+            certificates.extend(extra.certificates.iter().cloned());
         }
         certificates
     })
+}
+
+/// The `--ca-cert` roots as one PEM stack; empty when none are configured.
+pub fn extra_root_pem() -> &'static [u8] {
+    EXTRA_ROOTS
+        .get()
+        .map(|extra| extra.pem.as_slice())
+        .unwrap_or(&[])
 }
 
 /// Whether SSL_CERT_FILE / SSL_CERT_DIR request a custom TLS trust store. A
@@ -1100,6 +1238,7 @@ impl ObscuraHttpClient {
 
             if std::env::var_os("SSL_CERT_FILE").is_some()
                 || std::env::var_os("SSL_CERT_DIR").is_some()
+                || !extra_root_pem().is_empty()
             {
                 for certificate in configured_root_certificates() {
                     builder = builder.add_root_certificate(certificate.clone());
@@ -1737,6 +1876,9 @@ pub enum ObscuraNetError {
 
     #[error("Response body exceeded {limit} byte limit: {url}")]
     ResponseTooLarge { url: String, limit: usize },
+
+    #[error("CA certificate {0}")]
+    CaCertificate(String),
 }
 
 #[cfg(test)]
@@ -2942,6 +3084,134 @@ mod ssrf_tests {
         // The message must carry the TLS cause, not only "error sending request".
         let message = error.to_string();
         assert!(message.contains("invalid peer certificate"), "{message}");
+    }
+
+    // --ca-cert tests. `set_extra_root_certificates` stores into a process-wide
+    // OnceLock, so like the SSL_CERT_* tests above these are only correct under
+    // `cargo nextest` (one process per test).
+
+    fn write_ca_file(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), bytes).unwrap();
+        file
+    }
+
+    /// A second throwaway root, independent of the HTTPS fixture's CA, as
+    /// (PEM, DER).
+    fn throwaway_root() -> (String, Vec<u8>) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), cert.der().to_vec())
+    }
+
+    #[tokio::test]
+    async fn ca_cert_extra_roots_trust_a_private_ca() {
+        let (port, ca_pem) = https_fixture_with_private_ca().await;
+        let ca_file = write_ca_file(ca_pem.as_bytes());
+        let loaded = super::set_extra_root_certificates(&[ca_file.path().to_path_buf()])
+            .expect("a PEM root must load");
+        assert_eq!(loaded, 1);
+
+        let client =
+            ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
+        let resp = client.fetch(&url).await.expect("--ca-cert root must be trusted");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.text(), "private ca ok");
+    }
+
+    #[tokio::test]
+    async fn private_ca_still_rejected_without_extra_roots() {
+        let (port, _ca_pem) = https_fixture_with_private_ca().await;
+        assert!(super::extra_root_pem().is_empty());
+        let client =
+            ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
+        let error = client.fetch(&url).await.expect_err("unknown CA must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("UnknownIssuer"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn extra_roots_do_not_relax_hostname_check() {
+        // The fixture leaf is issued for 127.0.0.1 only. With its CA trusted
+        // through --ca-cert, asking for `localhost` must still fail on the name.
+        let (port, ca_pem) = https_fixture_with_private_ca().await;
+        let ca_file = write_ca_file(ca_pem.as_bytes());
+        super::set_extra_root_certificates(&[ca_file.path().to_path_buf()]).unwrap();
+
+        let client =
+            ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("https://localhost:{port}/")).unwrap();
+        let error = client
+            .fetch(&url)
+            .await
+            .expect_err("a leaf for 127.0.0.1 must not be valid for localhost");
+        // rustls spells NotValidForName out: `certificate not valid for name "localhost"`.
+        let message = error.to_string();
+        assert!(message.contains("invalid peer certificate"), "{message}");
+        assert!(message.contains("not valid for name \"localhost\""), "{message}");
+    }
+
+    #[test]
+    fn extra_roots_count_bundle_and_der() {
+        let (pem_a, _) = throwaway_root();
+        let (pem_b, der_b) = throwaway_root();
+        let bundle = write_ca_file(format!("{pem_a}{pem_b}").as_bytes());
+        let der = write_ca_file(&der_b);
+
+        let from_bundle =
+            super::load_extra_root_certificates(&[bundle.path().to_path_buf()]).unwrap();
+        assert_eq!(from_bundle.certificates.len(), 2);
+        let from_der = super::load_extra_root_certificates(&[der.path().to_path_buf()]).unwrap();
+        assert_eq!(from_der.certificates.len(), 1);
+        // The DER root is re-encoded so the wreq store can take one PEM stack.
+        assert_eq!(String::from_utf8(from_der.pem.clone()).unwrap(), pem_b);
+
+        let loaded = super::set_extra_root_certificates(&[
+            bundle.path().to_path_buf(),
+            der.path().to_path_buf(),
+        ])
+        .unwrap();
+        assert_eq!(loaded, 3);
+        assert_eq!(
+            String::from_utf8(super::extra_root_pem().to_vec()).unwrap(),
+            format!("{pem_a}{pem_b}{pem_b}")
+        );
+        // The CLI configures the roots exactly once.
+        let again = super::set_extra_root_certificates(&[der.path().to_path_buf()])
+            .expect_err("a second configuration must be refused");
+        assert!(again.to_string().contains("already configured"), "{again}");
+    }
+
+    #[test]
+    fn empty_pem_is_an_error() {
+        let empty = write_ca_file(b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n");
+        let error = super::set_extra_root_certificates(&[empty.path().to_path_buf()])
+            .expect_err("a PEM block holding no certificate must be refused");
+        let message = error.to_string();
+        assert!(message.contains(&empty.path().display().to_string()), "{message}");
+
+        // A private key is not a root either (M2-AC3).
+        let key_pem = rcgen::KeyPair::generate().unwrap().serialize_pem();
+        let key = write_ca_file(key_pem.as_bytes());
+        let error = super::set_extra_root_certificates(&[key.path().to_path_buf()])
+            .expect_err("a private key must be refused");
+        let message = error.to_string();
+        assert!(message.contains(&key.path().display().to_string()), "{message}");
+        assert!(super::extra_root_pem().is_empty(), "a failed load must not configure roots");
+    }
+
+    #[test]
+    fn bad_extra_root_path_is_an_error() {
+        let error = super::set_extra_root_certificates(&[std::path::PathBuf::from(
+            "/nonexistent/ca.pem",
+        )])
+        .expect_err("a missing file must be refused");
+        let message = error.to_string();
+        assert!(message.contains("/nonexistent/ca.pem"), "{message}");
     }
 
     #[test]

@@ -8,9 +8,10 @@ pub mod blocklist;
 pub mod wreq_client;
 
 pub use client::{
-    env_allows_private_network, is_forbidden_ip, CallbackRegistry, ObscuraHttpClient,
-    ObscuraNetError, RequestCallback, RequestCredentials, RequestInfo, RequestMode,
-    ResourceRequest, ResourceType, Response, ResponseCallback, SsrfGuardResolver,
+    configured_root_certificates, env_allows_private_network, extra_root_pem, is_forbidden_ip,
+    set_extra_root_certificates, CallbackRegistry, ObscuraHttpClient, ObscuraNetError,
+    RequestCallback, RequestCredentials, RequestInfo, RequestMode, ResourceRequest,
+    ResourceType, Response, ResponseCallback, SsrfGuardResolver,
 };
 pub use cookies::{
     canonical_domain, default_cookie_path, same_site, CookieInfo, CookieJar, SameSiteContext,
